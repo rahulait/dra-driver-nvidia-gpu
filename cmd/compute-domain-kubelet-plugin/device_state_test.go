@@ -55,7 +55,11 @@ func (m *fakeCheckpointManager) CreateCheckpoint(_ string, checkpoint checkpoint
 	m.creates++
 	cp, ok := checkpoint.(*Checkpoint)
 	if ok {
-		m.checkpoint = cp.ToLatestVersion()
+		var err error
+		m.checkpoint, err = cp.ToLatestVersion()
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -266,7 +270,7 @@ func TestUnprepareClearsALegacyCheckpointWithARejectedDomainID(t *testing.T) {
 
 			manager := requireFakeCheckpointManager(t, state)
 			require.Equal(t, 1, manager.creates, "the cleared entry must be written back")
-			pc, stillThere := manager.checkpoint.V2.PreparedClaims["claim-uid"]
+			pc, stillThere := manager.checkpoint.State.PreparedClaims["claim-uid"]
 			if tc.wantCleared {
 				require.False(t, stillThere, "a completed claim should be dropped from the checkpoint")
 				return
@@ -371,7 +375,7 @@ func TestPrepareLeavesNoCheckpointForARejectedClaim(t *testing.T) {
 			require.True(t, isPermanentError(err), "a claim rejected on its contents cannot become valid on a retry, got %v", err)
 			manager := requireFakeCheckpointManager(t, state)
 			require.Zero(t, manager.creates, "the claim was checkpointed even though nothing was applied for it")
-			require.Empty(t, manager.checkpoint.V2.PreparedClaims)
+			require.Empty(t, manager.checkpoint.State.PreparedClaims)
 		})
 	}
 }
@@ -415,7 +419,7 @@ func TestPrepareRejectsAnInvalidClaimBeforeCheckingOverlap(t *testing.T) {
 			require.Equal(t, tc.permanent, isPermanentError(err), "got %v", err)
 			manager := requireFakeCheckpointManager(t, state)
 			require.Zero(t, manager.creates)
-			require.Equal(t, PreparedClaimsByUID{"owner-uid": owner}, manager.checkpoint.V2.PreparedClaims)
+			require.Equal(t, PreparedClaimsByUID{"owner-uid": owner}, manager.checkpoint.State.PreparedClaims)
 		})
 	}
 }
@@ -465,7 +469,7 @@ func TestPrepareRejectsAMixedClaimBeforeApplying(t *testing.T) {
 
 	cpManager := requireFakeCheckpointManager(t, state)
 	require.Zero(t, cpManager.creates, "a claim rejected on its own contents must not reach the checkpoint")
-	require.Empty(t, cpManager.checkpoint.V2.PreparedClaims)
+	require.Empty(t, cpManager.checkpoint.State.PreparedClaims)
 
 	// Applying the valid daemon config first would have created its directory.
 	entries, err := os.ReadDir(configFilesRoot)
@@ -710,7 +714,7 @@ func TestPrepareRejectsMatchingPrepareAbortedEntry(t *testing.T) {
 	assert.True(t, isPermanentError(err))
 	assert.Contains(t, err.Error(), "claim prepare was already aborted")
 	assert.Nil(t, got)
-	assert.Equal(t, ClaimCheckpointStatePrepareAborted, requireFakeCheckpointManager(t, state).checkpoint.V2.PreparedClaims["claim-uid"].CheckpointState)
+	assert.Equal(t, ClaimCheckpointStatePrepareAborted, requireFakeCheckpointManager(t, state).checkpoint.State.PreparedClaims["claim-uid"].CheckpointState)
 }
 
 func TestClaimMatchesPreparedClaim(t *testing.T) {
@@ -745,12 +749,12 @@ func TestMarkClaimPrepareAbortedInCheckpointWritesEntry(t *testing.T) {
 		},
 		UID: "claim-uid",
 	}
-	pc := checkpoint.V2.PreparedClaims["claim-uid"]
+	pc := checkpoint.State.PreparedClaims["claim-uid"]
 
 	err := state.markClaimPrepareAbortedInCheckpoint(claimRef, pc)
 
 	require.NoError(t, err)
-	stored := requireFakeCheckpointManager(t, state).checkpoint.V2.PreparedClaims["claim-uid"]
+	stored := requireFakeCheckpointManager(t, state).checkpoint.State.PreparedClaims["claim-uid"]
 	assert.Equal(t, ClaimCheckpointStatePrepareAborted, stored.CheckpointState)
 	assert.Equal(t, "claim", stored.Name)
 	assert.Equal(t, "default", stored.Namespace)
@@ -776,7 +780,7 @@ func TestDeleteClaimFromCheckpoint(t *testing.T) {
 	err := state.deleteClaimFromCheckpoint(claimRef)
 
 	require.NoError(t, err)
-	assert.NotContains(t, requireFakeCheckpointManager(t, state).checkpoint.V2.PreparedClaims, "claim-uid")
+	assert.NotContains(t, requireFakeCheckpointManager(t, state).checkpoint.State.PreparedClaims, "claim-uid")
 }
 
 func TestDeleteExpiredPrepareAbortedClaimsFromCheckpoint(t *testing.T) {
@@ -802,7 +806,7 @@ func TestDeleteExpiredPrepareAbortedClaimsFromCheckpoint(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, deleted)
-	stored := requireFakeCheckpointManager(t, state).checkpoint.V2.PreparedClaims
+	stored := requireFakeCheckpointManager(t, state).checkpoint.State.PreparedClaims
 	assert.NotContains(t, stored, "old")
 	assert.Contains(t, stored, "fresh")
 	assert.Contains(t, stored, "completed")
@@ -1207,7 +1211,7 @@ func checkpointWithClaims(claims map[string]PreparedClaim) *Checkpoint {
 		claims = make(map[string]PreparedClaim)
 	}
 	return &Checkpoint{
-		V2: &CheckpointV2{
+		State: &CheckpointState{
 			PreparedClaims: claims,
 		},
 	}

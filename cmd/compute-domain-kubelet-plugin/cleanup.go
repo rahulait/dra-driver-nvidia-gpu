@@ -119,14 +119,14 @@ func (m *CheckpointCleanupManager) cleanup(ctx context.Context) {
 	}
 
 	// Get checkpointed claims in PrepareStarted state.
-	filtered := make(PreparedClaimsByUIDV2)
-	for uid, claim := range cp.V2.PreparedClaims {
+	filtered := make(PreparedClaimsByUID)
+	for uid, claim := range cp.State.PreparedClaims {
 		if claim.CheckpointState == ClaimCheckpointStatePrepareStarted {
 			filtered[uid] = claim
 		}
 	}
 
-	klog.V(4).Infof("Checkpointed RC cleanup: claims in PrepareStarted state: %d (of %d)", len(filtered), len(cp.V2.PreparedClaims))
+	klog.V(4).Infof("Checkpointed RC cleanup: claims in PrepareStarted state: %d (of %d)", len(filtered), len(cp.State.PreparedClaims))
 
 	for cpuid, cpclaim := range filtered {
 		m.unprepareIfStale(ctx, cpuid, cpclaim)

@@ -160,7 +160,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 				// note: this will temporary break the assertion that its prepared devices are prepared by the same boot ID
 				klog.V(4).Info("The existing checkpoint file does not contain a boot ID, injecting current boot ID")
 				err := state.updateCheckpoint(func(checkpoint *Checkpoint) {
-					checkpoint.V2.NodeBootID = currentBootID
+					checkpoint.State.NodeBootID = currentBootID
 				})
 				if err != nil {
 					return nil, fmt.Errorf("unable to update checkpoint: %w", err)
@@ -177,7 +177,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 	}
 
 	klog.Infof("Create empty checkpoint")
-	newCheckpoint := &Checkpoint{V2: &CheckpointV2{NodeBootID: currentBootID}}
+	newCheckpoint := &Checkpoint{State: &CheckpointState{NodeBootID: currentBootID}}
 	if err := state.createCheckpoint(newCheckpoint); err != nil {
 		return nil, fmt.Errorf("unable to create checkpoint: %w", err)
 	}
@@ -196,7 +196,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		return nil, fmt.Errorf("unable to get checkpoint: %w", err)
 	}
 
-	preparedClaim, exists := checkpoint.V2.PreparedClaims[claimUID]
+	preparedClaim, exists := checkpoint.State.PreparedClaims[claimUID]
 	if exists && preparedClaim.CheckpointState == ClaimCheckpointStatePrepareCompleted {
 		// Associated device(s) has/ave been prepared by us. Prepare() must be
 		// idempotent, as it may be invoked more than once per claim (and actual
@@ -228,7 +228,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	}
 
 	err = s.updateCheckpoint(func(checkpoint *Checkpoint) {
-		checkpoint.V2.PreparedClaims[claimUID] = PreparedClaim{
+		checkpoint.State.PreparedClaims[claimUID] = PreparedClaim{
 			CheckpointState: ClaimCheckpointStatePrepareStarted,
 			Status:          claim.Status,
 			Name:            claim.Name,
@@ -254,7 +254,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	// potentially partially prepared claims. There is an asynchronous
 	// checkpoint cleanup procedure that identifies when such entry goes stale.
 	err = s.updateCheckpoint(func(checkpoint *Checkpoint) {
-		checkpoint.V2.PreparedClaims[claimUID] = PreparedClaim{
+		checkpoint.State.PreparedClaims[claimUID] = PreparedClaim{
 			CheckpointState: ClaimCheckpointStatePrepareCompleted,
 			Status:          claim.Status,
 			PreparedDevices: preparedDevices,
@@ -283,7 +283,7 @@ func (s *DeviceState) Unprepare(ctx context.Context, claimRef kubeletplugin.Name
 	}
 
 	claimUID := string(claimRef.UID)
-	pc, exists := checkpoint.V2.PreparedClaims[claimUID]
+	pc, exists := checkpoint.State.PreparedClaims[claimUID]
 	if !exists {
 		// Not an error: if this claim UID is not in the checkpoint then this
 		// device was never prepared or has already been unprepared (assume that
@@ -370,7 +370,7 @@ func (s *DeviceState) getCheckpoint() (*Checkpoint, error) {
 		}
 		return nil, err
 	}
-	return checkpoint.ToLatestVersion(), nil
+	return checkpoint.ToLatestVersion()
 }
 
 // logCheckpointDiff is invoked when GetCheckpoint returns
@@ -428,7 +428,7 @@ func (s *DeviceState) updateCheckpoint(mutate func(*Checkpoint)) error {
 
 func (s *DeviceState) deleteClaimFromCheckpoint(claimRef kubeletplugin.NamespacedObject) error {
 	err := s.updateCheckpoint(func(cp *Checkpoint) {
-		delete(cp.V2.PreparedClaims, string(claimRef.UID))
+		delete(cp.State.PreparedClaims, string(claimRef.UID))
 	})
 	if err != nil {
 		return fmt.Errorf("unable to update checkpoint: %w", err)
@@ -446,7 +446,7 @@ func (s *DeviceState) markClaimPrepareAbortedInCheckpoint(claimRef kubeletplugin
 	pc.AbortedAt = &abortedAt
 
 	err := s.updateCheckpoint(func(cp *Checkpoint) {
-		cp.V2.PreparedClaims[string(claimRef.UID)] = pc
+		cp.State.PreparedClaims[string(claimRef.UID)] = pc
 	})
 	if err != nil {
 		return fmt.Errorf("unable to update checkpoint: %w", err)
@@ -471,7 +471,7 @@ func (s *DeviceState) deleteExpiredPrepareAbortedClaimsFromCheckpoint(now time.T
 
 	err = s.updateCheckpoint(func(cp *Checkpoint) {
 		for _, uid := range expired {
-			delete(cp.V2.PreparedClaims, uid)
+			delete(cp.State.PreparedClaims, uid)
 		}
 	})
 	if err != nil {
@@ -482,10 +482,10 @@ func (s *DeviceState) deleteExpiredPrepareAbortedClaimsFromCheckpoint(now time.T
 
 func expiredPrepareAbortedClaimEntries(cp *Checkpoint, now time.Time, ttl time.Duration) []string {
 	var expired []string
-	if cp == nil || cp.V2 == nil {
+	if cp == nil || cp.State == nil {
 		return expired
 	}
-	for uid, claim := range cp.V2.PreparedClaims {
+	for uid, claim := range cp.State.PreparedClaims {
 		if claim.CheckpointState != ClaimCheckpointStatePrepareAborted {
 			continue
 		}
@@ -921,7 +921,7 @@ func (s *DeviceState) assertImexChannelNotAllocated(id int) error {
 		return fmt.Errorf("unable to get checkpoint: %w", err)
 	}
 
-	for claimUID, claim := range cp.V2.PreparedClaims {
+	for claimUID, claim := range cp.State.PreparedClaims {
 		// Ignore non-completed preparations: file-based locking guarantees that
 		// only one Prepare() runs at any given time. If a claim is in the
 		// `PrepareStarted` state then it is not actually currently in progress
@@ -1069,7 +1069,7 @@ func (s *DeviceState) validateNoOverlappingPreparedDevices(checkpoint *Checkpoin
 		return nil
 	}
 
-	for existingClaimUID, pc := range checkpoint.V2.PreparedClaims {
+	for existingClaimUID, pc := range checkpoint.State.PreparedClaims {
 		// Skip the current claim.
 		if existingClaimUID == claimUID {
 			continue
@@ -1103,9 +1103,13 @@ func syncPreparedDevicesGaugeFromCheckpoint(nodeName string, cp *Checkpoint) {
 	if cp == nil {
 		return
 	}
-	lv := cp.ToLatestVersion()
-	if lv != nil && lv.V2 != nil {
-		for _, pc := range lv.V2.PreparedClaims {
+	lv, err := cp.ToLatestVersion()
+	if err != nil {
+		klog.Errorf("Unable to convert checkpoint for metrics: %v", err)
+		return
+	}
+	if lv != nil && lv.State != nil {
+		for _, pc := range lv.State.PreparedClaims {
 			if pc.CheckpointState != ClaimCheckpointStatePrepareCompleted {
 				continue
 			}

@@ -19,18 +19,55 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/stretchr/testify/require"
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilcache "k8s.io/apimachinery/pkg/util/cache"
+	"k8s.io/mount-utils"
 	"k8s.io/utils/ptr"
 
 	configapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/fabricmanager"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 )
+
+func TestPreparePreservesClaimIdentity(t *testing.T) {
+	state := newCleanupTestDeviceState(t, &Checkpoint{State: &CheckpointState{}})
+	state.config = &Config{flags: &Flags{nodeName: "node"}}
+	state.nvdevlib = &deviceLib{}
+	state.localIPCManager = NewLocalIPCManager(t.TempDir(), mount.NewFakeMounter(nil))
+	state.perGPUAllocatable = &PerGPUAllocatableDevices{allocatablesMap: map[PCIBusID]AllocatableDevices{
+		"0000:01:00.0": {"gpu-0": {Gpu: &GpuInfo{UUID: "GPU-test"}}},
+	}}
+	cache := utilcache.NewExpiring()
+	cache.Set("commonEdits", containerEdits(), time.Minute)
+	cache.Set("GPU-test", deviceSpecs("/dev/nvidia0"), time.Minute)
+	state.cdi = &CDIHandler{cdiRoot: t.TempDir(), driverRoot: "/", targetDriverRoot: "/", specCache: cache}
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: "namespace", UID: "claim-uid"},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{Devices: resourceapi.DeviceAllocationResult{
+				Results: []resourceapi.DeviceRequestAllocationResult{{Request: "gpu", Driver: DriverName, Pool: "node", Device: "gpu-0"}},
+			}},
+		},
+	}
+
+	// Cached CDI edits exercise the complete state transition without GPU hardware.
+	for range 2 {
+		_, err := state.Prepare(t.Context(), claim)
+		require.NoError(t, err)
+		cp, err := state.getCheckpoint(t.Context())
+		require.NoError(t, err)
+		prepared := cp.State.PreparedClaims[string(claim.UID)]
+		require.Equal(t, ClaimCheckpointStatePrepareCompleted, prepared.CheckpointState)
+		require.Equal(t, claim.Name, prepared.Name)
+		require.Equal(t, claim.Namespace, prepared.Namespace)
+	}
+}
 
 func TestValidateNoOverlappingPreparedDevices(t *testing.T) {
 	perGPU := &PerGPUAllocatableDevices{
@@ -43,7 +80,7 @@ func TestValidateNoOverlappingPreparedDevices(t *testing.T) {
 	}
 
 	checkpoint := &Checkpoint{
-		V2: &CheckpointV2{
+		State: &CheckpointState{
 			PreparedClaims: PreparedClaimsByUID{
 				"claim-1": {
 					CheckpointState: ClaimCheckpointStatePrepareCompleted,
@@ -310,7 +347,7 @@ func TestApplySharingConfigMpsDisallowedWithConsumableShares(t *testing.T) {
 
 func TestSharingReferenceCountingHelpers(t *testing.T) {
 	checkpoint := &Checkpoint{
-		V2: &CheckpointV2{
+		State: &CheckpointState{
 			PreparedClaims: PreparedClaimsByUID{
 				"claim-1": {
 					CheckpointState: ClaimCheckpointStatePrepareCompleted,
@@ -446,7 +483,7 @@ func TestDeactivateFabricPartitionRefCounting(t *testing.T) {
 	}))
 
 	checkpoint := &Checkpoint{
-		V2: &CheckpointV2{
+		State: &CheckpointState{
 			PreparedClaims: PreparedClaimsByUID{
 				"claim-1": {
 					CheckpointState: ClaimCheckpointStatePrepareCompleted,
@@ -536,7 +573,7 @@ func TestDeactivateFabricPartitionRefCounting(t *testing.T) {
 
 	smi := newFakePersistenceSMI(t, 0)
 	state.nvdevlib = smi.lib
-	pc1 := checkpoint.V2.PreparedClaims["claim-1"]
+	pc1 := checkpoint.State.PreparedClaims["claim-1"]
 
 	// Case 1: Unpreparing claim-1 while claim-2 is still active on GPU-0000.
 	// isGpuUUIDInUseByOtherClaims returns true -> deactivateFabricPartition returns nil early without calling FM DeactivatePartition.
@@ -547,7 +584,7 @@ func TestDeactivateFabricPartitionRefCounting(t *testing.T) {
 
 	// Case 2: Remove claim-2 from checkpoint so claim-1 is the sole claim.
 	// Now deactivateFabricPartition calls FM DeactivatePartition(1).
-	delete(checkpoint.V2.PreparedClaims, "claim-2")
+	delete(checkpoint.State.PreparedClaims, "claim-2")
 
 	err = state.deactivateFabricPartition("claim-1", &pc1, checkpoint)
 	require.NoError(t, err)
@@ -726,7 +763,7 @@ func TestGetPreparedMigDevice(t *testing.T) {
 		Device:   &CheckpointedDevice{DeviceName: "mig-0"},
 	}
 	checkpoint := &Checkpoint{
-		V2: &CheckpointV2{
+		State: &CheckpointState{
 			PreparedClaims: PreparedClaimsByUID{
 				"claim-completed": {
 					CheckpointState: ClaimCheckpointStatePrepareCompleted,
@@ -910,7 +947,7 @@ func TestRollbackPartiallyPreparedMIGDevicesIgnoresOtherDrivers(t *testing.T) {
 	completedWith := func(results ...resourceapi.DeviceRequestAllocationResult) *Checkpoint {
 		completed := claimWith(results...)
 		completed.CheckpointState = ClaimCheckpointStatePrepareCompleted
-		return &Checkpoint{V2: &CheckpointV2{PreparedClaims: PreparedClaimsByUID{"completed": completed}}}
+		return &Checkpoint{State: &CheckpointState{PreparedClaims: PreparedClaimsByUID{"completed": completed}}}
 	}
 
 	// The foreign name is on another GPU and placement, so a guard comparing
@@ -937,7 +974,7 @@ func TestRollbackPartiallyPreparedMIGDevicesIgnoresOtherDrivers(t *testing.T) {
 		pc := claimWith(resourceapi.DeviceRequestAllocationResult{Driver: DriverName, Device: ownedMIG})
 
 		err := state.rollbackPartiallyPreparedMIGDevices(context.Background(), "claim-uid", pc,
-			&Checkpoint{V2: &CheckpointV2{PreparedClaims: PreparedClaimsByUID{}}})
+			&Checkpoint{State: &CheckpointState{PreparedClaims: PreparedClaimsByUID{}}})
 
 		require.NoError(t, err)
 		require.Equal(t, 1, nvmllib.deviceGetHandleByUUIDCalls, "our own result must still reach MIG teardown")
@@ -1006,7 +1043,7 @@ func TestDestroyUnknownMIGDevicesIgnoresOtherDrivers(t *testing.T) {
 			}
 			parent := &GpuInfo{UUID: "GPU-0", migEnabled: true, migProfiles: []*MigProfileInfo{{profile: testMigProfile()}}}
 
-			state := newCleanupTestDeviceState(t, &Checkpoint{V2: &CheckpointV2{PreparedClaims: PreparedClaimsByUID{
+			state := newCleanupTestDeviceState(t, &Checkpoint{State: &CheckpointState{PreparedClaims: PreparedClaimsByUID{
 				"completed": {
 					CheckpointState: ClaimCheckpointStatePrepareCompleted,
 					Status: resourceapi.ResourceClaimStatus{Allocation: &resourceapi.AllocationResult{
@@ -1071,7 +1108,7 @@ func TestCheckpointedClaimThatCannotBeAccountedFor(t *testing.T) {
 
 	t.Run("the teardown routine leaves the GPUs alone", func(t *testing.T) {
 		visited := 0
-		state := newCleanupTestDeviceState(t, &Checkpoint{V2: &CheckpointV2{
+		state := newCleanupTestDeviceState(t, &Checkpoint{State: &CheckpointState{
 			PreparedClaims: completed(PreparedClaim{}),
 		}})
 		state.nvdevlib = &deviceLib{Interface: fakeNVMLDeviceLib{visited: &visited}}
@@ -1117,11 +1154,19 @@ func TestCheckpointedClaimThatCannotBeAccountedFor(t *testing.T) {
 	// keep-list pass for a complete one.
 	t.Run("a readable device beside an unreadable one", func(t *testing.T) {
 		visited := 0
-		state := newCleanupTestDeviceState(t, &Checkpoint{V2: &CheckpointV2{
+		// Legacy checkpoints may contain malformed devices. Their recovery path
+		// must still refuse destructive teardown; V3 rejects these on read/write.
+		state := newCleanupTestDeviceState(t, nil)
+		v2, err := convertCheckpoint[CheckpointV2](&CheckpointState{
 			PreparedClaims: completed(PreparedClaim{PreparedDevices: PreparedDevices{
 				{Devices: PreparedDeviceList{newPreparedMigDevice(owned, "MIG-0000"), {}, {Mig: &PreparedMigDevice{}}}},
 			}}),
-		}})
+		})
+		require.NoError(t, err)
+		legacy := &Checkpoint{V2: &v2, V1: v2.ToV1()}
+		require.NoError(t, legacy.SetChecksumV1())
+		require.NoError(t, legacy.SetChecksumV2())
+		require.NoError(t, state.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFileBasename, legacyCheckpointForTest{legacy}))
 		state.nvdevlib = &deviceLib{Interface: fakeNVMLDeviceLib{visited: &visited}}
 
 		require.NotPanics(t, func() { state.DestroyUnknownMIGDevices(t.Context()) })
@@ -1131,7 +1176,7 @@ func TestCheckpointedClaimThatCannotBeAccountedFor(t *testing.T) {
 	// Without this the teardown cases above would pass if the routine never ran.
 	t.Run("prepared devices let the teardown routine run", func(t *testing.T) {
 		visited := 0
-		state := newCleanupTestDeviceState(t, &Checkpoint{V2: &CheckpointV2{
+		state := newCleanupTestDeviceState(t, &Checkpoint{State: &CheckpointState{
 			PreparedClaims: completed(PreparedClaim{PreparedDevices: preparedWith(owned)}),
 		}})
 		state.nvdevlib = &deviceLib{Interface: fakeNVMLDeviceLib{visited: &visited}}
@@ -1145,7 +1190,7 @@ func TestCheckpointedClaimThatCannotBeAccountedFor(t *testing.T) {
 		state := &DeviceState{}
 
 		err := state.rollbackPartiallyPreparedMIGDevices(t.Context(), "claim-uid", PreparedClaim{},
-			&Checkpoint{V2: &CheckpointV2{PreparedClaims: PreparedClaimsByUID{}}})
+			&Checkpoint{State: &CheckpointState{PreparedClaims: PreparedClaimsByUID{}}})
 
 		require.NoError(t, err)
 	})

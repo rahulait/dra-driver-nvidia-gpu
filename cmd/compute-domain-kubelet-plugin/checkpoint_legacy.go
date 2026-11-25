@@ -18,6 +18,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 
 	drapbv1 "k8s.io/kubelet/pkg/apis/dra/v1beta1"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager/checksum"
@@ -143,7 +144,10 @@ func (g *PreparedDeviceGroup2503RC2) ToV1() *PreparedDeviceGroup {
 }
 
 // ToV1 converts a Checkpoint2503RC2 to a Checkpoint.
-func (cp *Checkpoint2503RC2) ToV1() *Checkpoint {
+func (cp *Checkpoint2503RC2) ToV1() (*Checkpoint, error) {
+	if cp.V1 == nil {
+		return nil, fmt.Errorf("RC2 checkpoint has no v1 state")
+	}
 	cpv1 := &Checkpoint{
 		V1: &CheckpointV1{
 			PreparedClaims: make(PreparedClaimsByUIDV1),
@@ -152,11 +156,18 @@ func (cp *Checkpoint2503RC2) ToV1() *Checkpoint {
 	for k, v := range cp.V1.PreparedClaims {
 		pds := make(PreparedDevices, 0, len(v))
 		for _, pd := range v {
+			if pd == nil {
+				return nil, fmt.Errorf("RC2 claim %q has a null device group", k)
+			}
 			pds = append(pds, pd.ToV1())
 		}
+		projected, err := convertCheckpoint[legacyPreparedDevices](pds)
+		if err != nil {
+			return nil, err
+		}
 		cpv1.V1.PreparedClaims[k] = PreparedClaimV1{
-			PreparedDevices: pds,
+			PreparedDevices: projected,
 		}
 	}
-	return cpv1
+	return cpv1, nil
 }

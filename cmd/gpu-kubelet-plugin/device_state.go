@@ -265,7 +265,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 				// note: this will temporary break the assertion that its prepared devices are prepared by the same boot ID
 				klog.V(4).Info("The existing checkpoint file does not contain a boot ID, injecting current boot ID")
 				err := state.updateCheckpoint(ctx, func(checkpoint *Checkpoint) {
-					checkpoint.V2.NodeBootID = currentBootID
+					checkpoint.State.NodeBootID = currentBootID
 				})
 				if err != nil {
 					return nil, fmt.Errorf("unable to update checkpoint: %w", err)
@@ -286,7 +286,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 	}
 
 	klog.Infof("Create empty checkpoint")
-	newCheckpoint := &Checkpoint{V2: &CheckpointV2{NodeBootID: currentBootID}}
+	newCheckpoint := &Checkpoint{State: &CheckpointState{NodeBootID: currentBootID}}
 	if err := state.createCheckpoint(ctx, newCheckpoint); err != nil {
 		return nil, fmt.Errorf("unable to create fresh checkpoint: %w", err)
 	}
@@ -322,7 +322,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	// perfectly prepared claim as only partially prepared, which may have
 	// negative side effects during Unprepare() (currently a noop in this case:
 	// unprepare noop: claim preparation started but not completed).
-	preparedClaim, exists := cp.V2.PreparedClaims[claimUID]
+	preparedClaim, exists := cp.State.PreparedClaims[claimUID]
 	if exists && preparedClaim.CheckpointState == ClaimCheckpointStatePrepareCompleted {
 		// Make this a noop. Associated device(s) has/ave been prepared by us.
 		// Prepare() must be idempotent, as it may be invoked more than once per
@@ -364,7 +364,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 
 	tucp0 := time.Now()
 	err = s.updateCheckpoint(ctx, func(cp *Checkpoint) {
-		cp.V2.PreparedClaims[claimUID] = PreparedClaim{
+		cp.State.PreparedClaims[claimUID] = PreparedClaim{
 			CheckpointState: ClaimCheckpointStatePrepareStarted,
 			Status:          claim.Status,
 			Name:            claim.Name,
@@ -415,10 +415,12 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 
 	tucp20 := time.Now()
 	err = s.updateCheckpoint(ctx, func(cp *Checkpoint) {
-		cp.V2.PreparedClaims[claimUID] = PreparedClaim{
+		cp.State.PreparedClaims[claimUID] = PreparedClaim{
 			CheckpointState: ClaimCheckpointStatePrepareCompleted,
 			Status:          claim.Status,
 			PreparedDevices: preparedDevices,
+			Name:            claim.Name,
+			Namespace:       claim.Namespace,
 		}
 	})
 	if err != nil {
@@ -493,8 +495,8 @@ func (s *DeviceState) DestroyUnknownMIGDevices(ctx context.Context) {
 	// down MIG devices that correspond to claims in a PrepareStarted limbo
 	// state -- that can only be correct when there are no overlapping
 	// NodePrepareResources() executions.
-	filtered := make(PreparedClaimsByUIDV2)
-	for uid, claim := range cp.V2.PreparedClaims {
+	filtered := make(PreparedClaimsByUID)
+	for uid, claim := range cp.State.PreparedClaims {
 		if claim.CheckpointState == ClaimCheckpointStatePrepareCompleted {
 			filtered[uid] = claim
 		}
@@ -537,7 +539,7 @@ func (s *DeviceState) Unprepare(ctx context.Context, claimRef kubeletplugin.Name
 	}
 
 	claimUID := string(claimRef.UID)
-	pc, exists := checkpoint.V2.PreparedClaims[claimUID]
+	pc, exists := checkpoint.State.PreparedClaims[claimUID]
 	if !exists {
 		// Not an error: if this claim UID is not in the checkpoint then this
 		// device was never prepared or has already been unprepared (assume that
@@ -780,8 +782,8 @@ func (s *DeviceState) rollbackPartiallyPreparedMIGDevices(ctx context.Context, c
 	// When DynamicMIG is enabled, try to identify an orphaned MIG device
 	// corresponding to `pc`. To that end, inspect which currently (completely)
 	// prepared claims use which devices.
-	completedClaims := make(PreparedClaimsByUIDV2)
-	for cuid, c := range checkpoint.V2.PreparedClaims {
+	completedClaims := make(PreparedClaimsByUID)
+	for cuid, c := range checkpoint.State.PreparedClaims {
 		if c.CheckpointState == ClaimCheckpointStatePrepareCompleted {
 			completedClaims[cuid] = c
 		}
@@ -848,7 +850,7 @@ func (s *DeviceState) rollbackPartiallyPreparedVFIODevices(ctx context.Context, 
 }
 
 func (s *DeviceState) reconcileCheckpointState(cp *Checkpoint) error {
-	if err := s.localIPCManager.Reconcile(cp.V2.PreparedClaims); err != nil {
+	if err := s.localIPCManager.Reconcile(cp.State.PreparedClaims); err != nil {
 		return fmt.Errorf("unable to reconcile local IPC directories: %w", err)
 	}
 	syncPreparedDevicesGaugeFromCheckpoint(s.config.flags.nodeName, cp)
@@ -889,7 +891,7 @@ func (s *DeviceState) getCheckpoint(ctx context.Context) (*Checkpoint, error) {
 	}
 
 	klog.V(7).Info("checkpoint read")
-	return checkpoint.ToLatestVersion(), nil
+	return checkpoint.ToLatestVersion()
 }
 
 // logCheckpointDiff is invoked when GetCheckpoint returns
@@ -947,7 +949,10 @@ func (s *DeviceState) updateCheckpoint(ctx context.Context, mutate func(*Checkpo
 	// Potentially migrate to newest version. This also creates an empty
 	// `PreparedClaims` map if that field is so far `nil` (so that insertion is
 	// always safe). This is also called in the getCheckpoint() helper.
-	cp := checkpoint.ToLatestVersion()
+	cp, err := checkpoint.ToLatestVersion()
+	if err != nil {
+		return err
+	}
 	mutate(cp)
 
 	err = s.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFileBasename, cp)
@@ -961,7 +966,7 @@ func (s *DeviceState) updateCheckpoint(ctx context.Context, mutate func(*Checkpo
 
 func (s *DeviceState) deleteClaimFromCheckpoint(ctx context.Context, claimRef kubeletplugin.NamespacedObject) error {
 	err := s.updateCheckpoint(ctx, func(cp *Checkpoint) {
-		delete(cp.V2.PreparedClaims, string(claimRef.UID))
+		delete(cp.State.PreparedClaims, string(claimRef.UID))
 	})
 	if err != nil {
 		return fmt.Errorf("unable to update checkpoint: %w", err)
@@ -1768,7 +1773,7 @@ func (s *DeviceState) validateNoOverlappingPreparedDevices(checkpoint *Checkpoin
 		return nil
 	}
 
-	for existingClaimUID, pc := range checkpoint.V2.PreparedClaims {
+	for existingClaimUID, pc := range checkpoint.State.PreparedClaims {
 		// Skip the current claim.
 		if existingClaimUID == claimUID {
 			continue
@@ -1956,10 +1961,10 @@ func normalizeAndValidateConfig(c runtime.Object) (configapi.Interface, error) {
 }
 
 func (s *DeviceState) getPreparedMigDevice(checkpoint *Checkpoint, deviceName string) *PreparedMigDevice {
-	if checkpoint == nil || checkpoint.V2 == nil {
+	if checkpoint == nil || checkpoint.State == nil {
 		return nil
 	}
-	for _, pc := range checkpoint.V2.PreparedClaims {
+	for _, pc := range checkpoint.State.PreparedClaims {
 		if pc.CheckpointState != ClaimCheckpointStatePrepareCompleted {
 			continue
 		}
@@ -1975,10 +1980,10 @@ func (s *DeviceState) getPreparedMigDevice(checkpoint *Checkpoint, deviceName st
 }
 
 func isMigDeviceInUseByOtherClaims(checkpoint *Checkpoint, claimUID string, migUUID string, deviceName string) bool {
-	if checkpoint == nil || checkpoint.V2 == nil {
+	if checkpoint == nil || checkpoint.State == nil {
 		return false
 	}
-	for otherUID, otherClaim := range checkpoint.V2.PreparedClaims {
+	for otherUID, otherClaim := range checkpoint.State.PreparedClaims {
 		if otherUID == claimUID {
 			continue
 		}
@@ -2000,10 +2005,10 @@ func isMigDeviceInUseByOtherClaims(checkpoint *Checkpoint, claimUID string, migU
 }
 
 func isGpuUUIDInUseByOtherClaims(checkpoint *Checkpoint, claimUID string, gpuUUID string) bool {
-	if checkpoint == nil || checkpoint.V2 == nil {
+	if checkpoint == nil || checkpoint.State == nil {
 		return false
 	}
-	for otherUID, otherClaim := range checkpoint.V2.PreparedClaims {
+	for otherUID, otherClaim := range checkpoint.State.PreparedClaims {
 		if otherUID == claimUID {
 			continue
 		}
@@ -2079,9 +2084,13 @@ func syncPreparedDevicesGaugeFromCheckpoint(nodeName string, cp *Checkpoint) {
 	if cp == nil {
 		return
 	}
-	lv := cp.ToLatestVersion()
-	if lv != nil && lv.V2 != nil {
-		for _, pc := range lv.V2.PreparedClaims {
+	lv, err := cp.ToLatestVersion()
+	if err != nil {
+		klog.Errorf("Unable to convert checkpoint for metrics: %v", err)
+		return
+	}
+	if lv != nil && lv.State != nil {
+		for _, pc := range lv.State.PreparedClaims {
 			if pc.CheckpointState != ClaimCheckpointStatePrepareCompleted {
 				continue
 			}

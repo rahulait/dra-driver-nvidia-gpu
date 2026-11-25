@@ -403,7 +403,7 @@ func TestDeviceStateRollbackAfterComputeInstanceCreationFailure(t *testing.T) {
 			},
 		},
 	}
-	checkpoint := &Checkpoint{V2: &CheckpointV2{PreparedClaims: PreparedClaimsByUID{
+	checkpoint := &Checkpoint{State: &CheckpointState{PreparedClaims: PreparedClaimsByUID{
 		"claim-uid": preparedClaim,
 	}}}
 	state := &DeviceState{

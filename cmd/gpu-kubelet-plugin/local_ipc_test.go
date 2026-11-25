@@ -145,6 +145,46 @@ func TestLocalIPCReconcile(t *testing.T) {
 	require.Len(t, mounter.MountPoints, 1, "stale claim mounts must be unmounted")
 }
 
+func TestReconcileCheckpointStateLocalIPC(t *testing.T) {
+	mounter := mount.NewFakeMounter(nil)
+	manager := NewLocalIPCManager(t.TempDir(), mounter)
+	for _, uid := range []string{"active", "stale"} {
+		_, err := manager.ensureDirectory(uid)
+		require.NoError(t, err)
+	}
+	marker := filepath.Join(manager.root, "active", "marker")
+	require.NoError(t, os.WriteFile(marker, []byte("preserved"), 0o600))
+
+	checkpoint := &Checkpoint{State: &CheckpointState{
+		PreparedClaims: PreparedClaimsByUID{
+			"active": {
+				CheckpointState: ClaimCheckpointStatePrepareCompleted,
+				Status: resourceapi.ResourceClaimStatus{
+					Allocation: allocationWithLocalIPCConfig(),
+				},
+			},
+		},
+	}}
+	data, err := checkpoint.MarshalCheckpoint()
+	require.NoError(t, err)
+	restored, err := readTestCheckpoint(t, data).ToLatestVersion()
+	require.NoError(t, err)
+	require.Nil(t, restored.V2)
+
+	state := &DeviceState{
+		config:          &Config{flags: &Flags{nodeName: "test-node"}},
+		localIPCManager: manager,
+	}
+	require.NoError(t, state.reconcileCheckpointState(restored))
+	contents, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	assert.Equal(t, "preserved", string(contents))
+	assertLocalIPCMounted(t, mounter, filepath.Join(manager.root, "active"))
+	_, err = os.Stat(filepath.Join(manager.root, "stale"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.Len(t, mounter.MountPoints, 1)
+}
+
 func TestLocalIPCInfoGetCDIContainerEdits(t *testing.T) {
 	info := &LocalIPCInfo{HostPath: "/host/claim", ContainerPath: localIPCContainerPath}
 

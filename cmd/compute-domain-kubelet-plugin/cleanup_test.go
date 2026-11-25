@@ -53,7 +53,7 @@ func TestCleanupDeletesExpiredPrepareAbortedEntries(t *testing.T) {
 	manager.cleanup(context.Background())
 
 	require.True(t, expiredCleanupCalled)
-	stored := requireFakeCheckpointManager(t, state).checkpoint.V2.PreparedClaims
+	stored := requireFakeCheckpointManager(t, state).checkpoint.State.PreparedClaims
 	assert.NotContains(t, stored, "old-aborted")
 	assert.Contains(t, stored, "fresh-aborted")
 }

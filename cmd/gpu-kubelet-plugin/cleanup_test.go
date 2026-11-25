@@ -184,8 +184,8 @@ func TestUnprepareIfStale(t *testing.T) {
 
 func TestCleanupOnlyProcessesPrepareStarted(t *testing.T) {
 	checkpoint := &Checkpoint{
-		V2: &CheckpointV2{
-			PreparedClaims: PreparedClaimsByUIDV2{
+		State: &CheckpointState{
+			PreparedClaims: PreparedClaimsByUID{
 				"stale-uid": {
 					CheckpointState: ClaimCheckpointStatePrepareStarted,
 					Name:            "stale-claim",
@@ -199,11 +199,6 @@ func TestCleanupOnlyProcessesPrepareStarted(t *testing.T) {
 				"completed-uid": {
 					CheckpointState: ClaimCheckpointStatePrepareCompleted,
 					Name:            "completed-claim",
-					Namespace:       "default",
-				},
-				"unset-uid": {
-					CheckpointState: ClaimCheckpointStateUnset,
-					Name:            "unset-claim",
 					Namespace:       "default",
 				},
 			},
